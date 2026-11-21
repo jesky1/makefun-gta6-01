@@ -1,17 +1,19 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
+// Caldera Heat — boot and the one game loop. Input is read every frame,
+// the world advances in fixed 1/60 s steps (several in a slow frame, none
+// in a fast one) and the renderer paints what is there. Screens: title,
+// play, paused, run-over (busted/wasted tally) and the story-complete win.
 //
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
+// ?seed=N fixes the city layout and traffic. ?shot=start|play|end (with
+// &seed=N) stages that scene instead of running the loop, paints it twice
+// and sets window.__shotReady for the screenshot harness.
+
+import { BEST_KEY, STEP } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+import { createWorld, EVENT_BUSTED, EVENT_COMPLETE, EVENT_WASTED } from './world.js';
+import { ACTION_ACT, ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
+import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
 const MAX_FRAME = 0.25;
 
 const params = new URLSearchParams(window.location.search);
@@ -25,26 +27,19 @@ const world = createWorld(createRandom(seed));
 const renderer = createRenderer(canvas);
 
 function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+  try { return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0; }
+  catch { return 0; }
 }
-
 function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
+  try { window.localStorage.setItem(BEST_KEY, String(value)); }
+  catch { /* private windows: the best take lasts this visit only */ }
 }
 
 function runShot(name) {
   const scene = stageShot(name, world);
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+    renderer.draw(world.state, scene.screen, 0);
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -58,75 +53,64 @@ function runGame() {
   let best = readBest();
   let accumulator = 0;
   let last = performance.now();
+  let flashTimer = 0;
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
+  function announce(message) { status.textContent = message; }
+  function noteTake() {
+    if (world.state.player.money > best) { best = world.state.player.money; saveBest(best); }
   }
-
   function startGame() {
     world.reset();
+    input.frame(); // flush any stale interact tap
     accumulator = 0;
     screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    announce('Playing Caldera Heat. Mission one: get in the sedan.');
   }
 
   function frame(now) {
     requestAnimationFrame(frame);
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
+
+    const actions = input.takeActions();
+    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
+    else if (actions & ACTION_CONFIRM && screen === SCREEN_WIN) screen = SCREEN_PLAY;
+    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) { screen = SCREEN_PAUSED; announce('Paused.'); }
+    else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) { screen = SCREEN_PLAY; announce('Playing.'); }
+
+    if (screen === SCREEN_PLAY) {
+      let pendingAct = (actions & ACTION_ACT) !== 0;
+      while (accumulator >= STEP && screen === SCREEN_PLAY) {
+        const frameInput = input.frame();
+        if (pendingAct) { frameInput.act = true; pendingAct = false; }
+        const events = world.step(STEP, frameInput);
         accumulator -= STEP;
+        if (events & EVENT_COMPLETE) { noteTake(); screen = SCREEN_WIN; announce('Story complete. You run Caldera Bay.'); }
+        else if (events & (EVENT_BUSTED | EVENT_WASTED)) {
+          noteTake();
+          flashTimer = 1.6;
+          announce(events & EVENT_BUSTED ? 'Busted.' : 'Wasted.');
+        }
       }
+    } else if (screen === SCREEN_TITLE) {
+      while (accumulator >= STEP) { world.step(STEP, { mx: 0, my: 0, act: false }); accumulator -= STEP; }
     } else {
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+
+    if (flashTimer > 0) {
+      flashTimer -= 1 / 60;
+      renderer.draw(world.state, SCREEN_OVER, best);
+    } else {
+      renderer.draw(world.state, screen, best);
+    }
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
+    if (document.hidden && screen === SCREEN_PLAY) { screen = SCREEN_PAUSED; announce('Paused.'); }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
+  announce('Caldera Heat. Press Space or click to start.');
   requestAnimationFrame(frame);
 }
 
