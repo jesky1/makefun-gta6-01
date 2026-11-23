@@ -1,79 +1,63 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
+// Deterministic screenshot scenes for ?shot=start|city|drive|chase&seed=N.
+// Each stages the real simulation: fixed steps, scripted input, then a fixed
+// camera. Same seed, same frame, every time.
+export const SHOT_NAMES = ['start', 'city', 'drive', 'chase'];
+function seekInput(game, tx, tz, sprint = true) {
+  const p = game.player;
+  const a = Math.atan2(tx - p.x, tz - p.z);
+  if (p.inCar != null) {
+    const car = game.cars.find((c) => c.id === p.inCar);
+    let diff = a - car.angle;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    return { x: Math.max(-1, Math.min(1, diff * 2)), z: Math.abs(diff) < 1.1 ? 1 : 0.2, camAngle: car.angle };
   }
-  return Infinity;
+  return { x: Math.sin(a), z: -Math.cos(a), sprint, camAngle: 0 };
 }
-
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
+export function stageShot(game, name) {
+  game.start();
+  const p = game.player;
+  if (name === 'start') {
+    for (let i = 0; i < 40; i++) game.step({ x: 0, z: 0 });
+    game.camera = { x: p.x, z: p.z, angle: 2.4, dist: 13, height: 5 };
+    return;
   }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
+  if (name === 'city') {
+    p.x = -30; p.z = 0;
+    for (let i = 0; i < 90; i++) game.step({ x: 0, z: 0 });
+    game.camera = { x: -30, z: 0, angle: 0.7, dist: 85, height: 55 };
+    return;
+  }
+  if (name === 'drive') {
+    // Walk to the nearest parked car, get in, and drive up the avenue.
+    let car = null, bd = Infinity;
+    for (const c of game.cars) {
+      if (c.kind !== 'parked') continue;
+      const d = (c.x - p.x) ** 2 + (c.z - p.z) ** 2;
+      if (d < bd) { bd = d; car = c; }
     }
+    p.x = car.x + 2.5; p.z = car.z;
+    game.step({ interact: true });
+    for (let i = 0; i < 110; i++) game.step({ x: 0, z: 1, camAngle: car.angle });
+    game.camera = null;
+    game.camAngle = car.angle;
+    return;
   }
-  return best;
-}
-
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+  if (name === 'chase') {
+    let car = null, bd = Infinity;
+    for (const c of game.cars) {
+      if (c.kind !== 'parked') continue;
+      const d = (c.x - p.x) ** 2 + (c.z - p.z) ** 2;
+      if (d < bd) { bd = d; car = c; }
+    }
+    p.x = car.x + 2.5; p.z = car.z;
+    game.step({ interact: true });
+    game.addHeat(3.2);
+    for (let i = 0; i < 100; i++) game.step({ x: 0, z: 1, camAngle: car.angle });
+    // Fixed offset camera behind the player's car: the plain follow cam can
+    // end up behind a roadside palm trunk and hide the chase entirely.
+    game.camera = { x: car.x, z: car.z, angle: car.angle + Math.PI + 0.55, dist: 17, height: 8 };
+    return;
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
-  }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  throw new Error('unknown shot: ' + name);
 }

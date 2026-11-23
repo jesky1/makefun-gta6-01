@@ -1,141 +1,207 @@
-// Drawing only: the world's state and the current screen in, pixels out. The 1280x720 playfield
-// is scaled to fit the window and centred, the margin filled with the backdrop colour. Flat
-// rectangles and circles, canvas text for the HUD and the panels. Text that holds a number is
-// rebuilt only when the number changes, so a frame allocates nothing.
-import { FIELD, FONT, LIVES, PALETTE } from './config.js';
-import { KIND_COIN } from './world.js';
-
-export const SCREEN_TITLE = 'title';
-export const SCREEN_PLAY = 'play';
-export const SCREEN_PAUSED = 'paused';
-export const SCREEN_OVER = 'over';
-
-/** The panel's width; its height grows with its lines: room for the title, the lines and the prompt. */
-const PANEL = { width: 600, top: 134, line: 34, bottom: 70 };
-const LIFE_SIZE = 20;
-const LIFE_GAP = 8;
-
-function cachedLabel(prefix) {
-  let value = -1;
-  let text = '';
-  return function label(next) {
-    if (next !== value) {
-      value = next;
-      text = prefix + next;
-    }
-    return text;
-  };
+// WebGL1 low-poly renderer for Caldera Bay. Static city geometry is merged
+// into one buffer (buildings get lit window quads); cars and people are built
+// each frame from box and cylinder parts into a dynamic buffer.
+function matPerspective(fov, asp, near, far) {
+  const f = 1 / Math.tan(fov / 2), nf = 1 / (near - far);
+  return [f / asp, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0];
 }
-
-export function createRenderer(canvas) {
-  const context = canvas.getContext('2d');
-  const view = { scale: 1, x: 0, y: 0 };
-  const scoreLabel = cachedLabel('Score ');
-  const levelLabel = cachedLabel('Level ');
-  const finalLabel = cachedLabel('Score ');
-  const bestLabel = cachedLabel('Best ');
-
-  function resize() {
-    const ratio = window.devicePixelRatio || 1;
-    const width = Math.round(window.innerWidth * ratio);
-    const height = Math.round(window.innerHeight * ratio);
-    canvas.width = width;
-    canvas.height = height;
-    view.scale = Math.min(width / FIELD.width, height / FIELD.height);
-    view.x = (width - FIELD.width * view.scale) / 2;
-    view.y = (height - FIELD.height * view.scale) / 2;
+function matLookAt(ex, ey, ez, tx, ty, tz) {
+  let zx = ex - tx, zy = ey - ty, zz = ez - tz;
+  const zl = Math.hypot(zx, zy, zz) || 1; zx /= zl; zy /= zl; zz /= zl;
+  let xx = 1 * zz - 0 * zy, xy = 0 * zx - 0 * zz, xz = 0 * zy - 1 * zx;
+  const xl = Math.hypot(xx, xy, xz) || 1; xx /= xl; xy /= xl; xz /= xl;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return [xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * ex + xy * ey + xz * ez), -(yx * ex + yy * ey + yz * ez), -(zx * ex + zy * ey + zz * ez), 1];
+}
+function matMul(a, b) {
+  const o = new Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
   }
-
-  const fonts = new Map();
-  function text(value, x, y, size, color, align) {
-    if (!fonts.has(size)) fonts.set(size, `${size}px ${FONT}`);
-    context.font = fonts.get(size);
-    context.fillStyle = color;
-    context.textAlign = align;
-    context.fillText(value, x, y);
+  return o;
+}
+class Geo {
+  constructor() { this.pos = []; this.nor = []; this.col = []; }
+  quad(p1, p2, p3, p4, n, c) {
+    const P = this.pos, N = this.nor, C = this.col;
+    for (const p of [p1, p2, p3, p1, p3, p4]) P.push(p[0], p[1], p[2]);
+    for (let i = 0; i < 6; i++) { N.push(n[0], n[1], n[2]); C.push(c[0], c[1], c[2]); }
   }
-
-  function drawField(state) {
-    context.fillStyle = PALETTE.sky;
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-    context.fillStyle = PALETTE.ground;
-    context.fillRect(0, FIELD.groundY, FIELD.width, FIELD.height - FIELD.groundY);
-
-    const items = state.items;
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      if (item.kind === KIND_COIN) {
-        context.fillStyle = PALETTE.coin;
-        context.beginPath();
-        context.arc(item.x + item.width / 2, item.y + item.height / 2, item.width / 2, 0, Math.PI * 2);
-        context.fill();
+  box(cx, cy, cz, sx, sy, sz, c, ry = 0) {
+    const hx = sx / 2, hy = sy / 2, hz = sz / 2, cs = Math.cos(ry), sn = Math.sin(ry);
+    const R = (x, z) => [cx + x * cs + z * sn, cz - x * sn + z * cs];
+    const corners = [];
+    for (const [x, y, z] of [[-hx, -hy, -hz], [hx, -hy, -hz], [hx, -hy, hz], [-hx, -hy, hz], [-hx, hy, -hz], [hx, hy, -hz], [hx, hy, hz], [-hx, hy, hz]]) {
+      const [wx, wz] = R(x, z); corners.push([wx, cy + y, wz]);
+    }
+    const faces = [[0, 1, 2, 3, [0, -1, 0]], [4, 7, 6, 5, [0, 1, 0]], [0, 4, 5, 1, [0, 0, -1]], [2, 6, 7, 3, [0, 0, 1]], [1, 5, 6, 2, [1, 0, 0]], [3, 7, 4, 0, [-1, 0, 0]]];
+    for (const [a, b, cc, d, n] of faces) {
+      const wn = [n[0] * cs + n[2] * sn, n[1], -n[0] * sn + n[2] * cs];
+      this.quad(corners[a], corners[b], corners[cc], corners[d], wn, c);
+    }
+  }
+  cylinder(cx, cy, cz, r, h, c, axisX = false) {
+    const seg = 8;
+    for (let i = 0; i < seg; i++) {
+      const a1 = (i / seg) * Math.PI * 2, a2 = ((i + 1) / seg) * Math.PI * 2;
+      let lo1, lo2, hi1, hi2;
+      if (axisX) {
+        lo1 = [cx - h / 2, cy + Math.cos(a1) * r, cz + Math.sin(a1) * r];
+        lo2 = [cx - h / 2, cy + Math.cos(a2) * r, cz + Math.sin(a2) * r];
+        hi1 = [cx + h / 2, cy + Math.cos(a1) * r, cz + Math.sin(a1) * r];
+        hi2 = [cx + h / 2, cy + Math.cos(a2) * r, cz + Math.sin(a2) * r];
       } else {
-        context.fillStyle = PALETTE.block;
-        context.fillRect(item.x, item.y, item.width, item.height);
+        lo1 = [cx + Math.cos(a1) * r, cy - h / 2, cz + Math.sin(a1) * r];
+        lo2 = [cx + Math.cos(a2) * r, cy - h / 2, cz + Math.sin(a2) * r];
+        hi1 = [cx + Math.cos(a1) * r, cy + h / 2, cz + Math.sin(a1) * r];
+        hi2 = [cx + Math.cos(a2) * r, cy + h / 2, cz + Math.sin(a2) * r];
+      }
+      const n = axisX ? [0, Math.cos((a1 + a2) / 2), Math.sin((a1 + a2) / 2)] : [Math.cos((a1 + a2) / 2), 0, Math.sin((a1 + a2) / 2)];
+      this.quad(lo1, lo2, hi2, hi1, n, c);
+    }
+  }
+}
+export function createRenderer(canvas) {
+  const gl = canvas.getContext('webgl', { antialias: true });
+  if (!gl) return { draw() {}, ok: false };
+  const vs = `attribute vec3 aPos; attribute vec3 aNor; attribute vec3 aCol;
+    uniform mat4 uMvp; varying vec3 vCol; varying float vLight;
+    void main(){ gl_Position = uMvp * vec4(aPos,1.0);
+      vec3 n = normalize(aNor); vLight = 0.45 + 0.55 * abs(dot(n, normalize(vec3(0.4,0.8,0.3))));
+      vCol = aCol; }`;
+  const fs = `precision mediump float; varying vec3 vCol; varying float vLight;
+    void main(){ gl_FragColor = vec4(vCol * vLight, 1.0); }`;
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(prog); gl.useProgram(prog);
+  const loc = { pos: gl.getAttribLocation(prog, 'aPos'), nor: gl.getAttribLocation(prog, 'aNor'), col: gl.getAttribLocation(prog, 'aCol'), mvp: gl.getUniformLocation(prog, 'uMvp') };
+  function upload(geo, dynamic) {
+    const verts = geo.pos.length / 3;
+    const arr = new Float32Array(verts * 9);
+    for (let i = 0; i < verts; i++) {
+      arr.set(geo.pos.slice(i * 3, i * 3 + 3), i * 9);
+      arr.set(geo.nor.slice(i * 3, i * 3 + 3), i * 9 + 3);
+      arr.set(geo.col.slice(i * 3, i * 3 + 3), i * 9 + 6);
+    }
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, arr, dynamic ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW);
+    return { buf, count: verts };
+  }
+  function bind(b) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, b.buf);
+    gl.enableVertexAttribArray(loc.pos); gl.enableVertexAttribArray(loc.nor); gl.enableVertexAttribArray(loc.col);
+    gl.vertexAttribPointer(loc.pos, 3, gl.FLOAT, false, 36, 0);
+    gl.vertexAttribPointer(loc.nor, 3, gl.FLOAT, false, 36, 12);
+    gl.vertexAttribPointer(loc.col, 3, gl.FLOAT, false, 36, 24);
+  }
+  let staticBuf = null;
+  function buildStatic(city) {
+    const g = new Geo();
+    g.box(0, -0.6, 0, 380, 1, 300, [0.16, 0.30, 0.20]);
+    g.box(0, -1.6, 0, 470, 1, 390, [0.05, 0.16, 0.28]);
+    for (const gx of [-150, -90, -30, 30, 90, 150]) g.box(gx, 0.02, 0, 13, 0.1, 236, [0.10, 0.10, 0.12]);
+    for (const gz of [-110, -55, 0, 55, 110]) g.box(0, 0.02, gz, 316, 0.1, 13, [0.10, 0.10, 0.12]);
+    for (const b of city.buildings) {
+      g.box(b.x, b.h / 2, b.z, b.w, b.h, b.d, b.color);
+      const rows = Math.min(6, Math.floor(b.h / 6)), cols = Math.min(5, Math.floor(b.w / 4));
+      for (let r = 0; r < rows; r++) for (let cix = 0; cix < cols; cix++) {
+        if ((r * 7 + cix * 13 + Math.floor(b.x)) % 3 === 0) continue;
+        const wx = cols > 1 ? b.x - b.w / 2 + 2 + cix * ((b.w - 4) / (cols - 1)) : b.x;
+        g.box(wx, 3 + r * 5.4, b.z + b.d / 2 + 0.06, 1.4, 2.0, 0.1, [0.95, 0.8, 0.4]);
       }
     }
-
-    const player = state.player;
-    // Blink while invulnerable after a hit: hidden on every other tenth of a second.
-    if (player.invulnerable === 0 || Math.floor(player.invulnerable * 10) % 2 === 1) {
-      context.fillStyle = PALETTE.player;
-      context.fillRect(player.x, player.y, player.width, player.height);
+    for (const p of city.palms) {
+      g.cylinder(p.x, p.h / 2, p.z, 0.35, p.h, [0.4, 0.3, 0.18]);
+      g.box(p.x, p.h + 0.4, p.z, 5.5, 0.35, 1.2, [0.15, 0.55, 0.25]);
+      g.box(p.x, p.h + 0.4, p.z, 1.2, 0.35, 5.5, [0.15, 0.55, 0.25]);
+    }
+    const poiColors = { cafe: [0.95, 0.6, 0.2], spray: [0.2, 0.8, 0.9], hospital: [0.95, 0.95, 0.95], police: [0.2, 0.3, 0.95], docks: [0.7, 0.5, 0.2], overlook: [0.9, 0.3, 0.6] };
+    for (const key of Object.keys(city.pois)) {
+      const p = city.pois[key];
+      g.cylinder(p.x, 3, p.z, 0.5, 6, poiColors[key] || [1, 1, 1]);
+      g.box(p.x, 6.4, p.z, 2.4, 1.2, 2.4, poiColors[key] || [1, 1, 1]);
+    }
+    return upload(g, false);
+  }
+  function drawCar(g, car, t) {
+    const { x, z, angle } = car;
+    const cs = Math.cos(angle), sn = Math.sin(angle);
+    const at = (lx, lz) => [x + lx * cs + lz * sn, z - lx * sn + lz * cs];
+    const body = car.kind === 'police' ? [0.92, 0.92, 0.95] : car.color;
+    let [bx, bz] = at(0, 0);
+    g.box(bx, 0.75, bz, 2.0, 0.8, 4.2, body, angle);
+    [bx, bz] = at(0, -0.2);
+    g.box(bx, 1.45, bz, 1.7, 0.65, 2.0, car.kind === 'taxi' ? [0.95, 0.75, 0.15] : [0.12, 0.14, 0.2], angle);
+    if (car.kind === 'taxi') { const [tx2, tz2] = at(0, -0.2); g.box(tx2, 1.9, tz2, 0.8, 0.25, 0.5, [0.95, 0.85, 0.2], angle); }
+    if (car.kind === 'police') {
+      const [lx2, lz2] = at(0, -0.2);
+      g.box(lx2, 1.9, lz2, 1.2, 0.22, 0.5, (t % 30 < 15) ? [0.9, 0.1, 0.1] : [0.1, 0.2, 0.95], angle);
+    }
+    for (const [lx, lz] of [[-0.95, 1.35], [0.95, 1.35], [-0.95, -1.35], [0.95, -1.35]]) {
+      const [wx, wz] = at(lx, lz);
+      // Wheel cylinders: axis across the car.
+      const seg = 6;
+      for (let i = 0; i < seg; i++) {
+        const a1 = (i / seg) * Math.PI * 2, a2 = ((i + 1) / seg) * Math.PI * 2;
+        const p = (s, a) => { const lx2 = lx + s * 0.16, lz2 = lz; const wy = 0.45 + Math.sin(a) * 0.45; const off = Math.cos(a) * 0.45; const [qx, qz] = at(lx2, lz2 + off); return [qx, wy, qz]; };
+        g.quad(p(-1, a1), p(-1, a2), p(1, a2), p(1, a1), [0, 0, 1], [0.05, 0.05, 0.05]);
+      }
     }
   }
-
-  function drawHud(state) {
-    context.textBaseline = 'top';
-    text(scoreLabel(state.score), 24, 20, 28, PALETTE.text, 'left');
-    text(levelLabel(state.level), FIELD.width / 2, 20, 28, PALETTE.text, 'center');
-    const firstLife = FIELD.width - 24 - LIVES * (LIFE_SIZE + LIFE_GAP) + LIFE_GAP;
-    text('Lives', firstLife - 12, 20, 28, PALETTE.text, 'right');
-    for (let life = 0; life < LIVES; life += 1) {
-      context.fillStyle = life < state.lives ? PALETTE.player : PALETTE.ground;
-      context.fillRect(firstLife + life * (LIFE_SIZE + LIFE_GAP), 24, LIFE_SIZE, LIFE_SIZE);
+  function drawPerson(g, x, z, angle, shirt, down = false) {
+    if (down) { g.box(x, 0.25, z, 0.7, 0.4, 1.8, shirt, angle); return; }
+    const cs = Math.cos(angle), sn = Math.sin(angle);
+    const at = (lx, lz) => [x + lx * cs + lz * sn, z - lx * sn + lz * cs];
+    g.box(x, 1.15, z, 0.62, 0.85, 0.34, shirt, angle);
+    g.box(x, 1.85, z, 0.42, 0.45, 0.42, [0.85, 0.65, 0.5], angle);
+    for (const s of [-1, 1]) {
+      const [lx2, lz2] = at(s * 0.18, 0);
+      g.cylinder(lx2, 0.4, lz2, 0.11, 0.8, [0.16, 0.16, 0.3]);
+      const [ax, az] = at(s * 0.42, 0);
+      g.cylinder(ax, 1.15, az, 0.09, 0.75, shirt);
     }
   }
-
-  function drawPanel(title, lines, prompt) {
-    const height = PANEL.top + lines.length * PANEL.line + PANEL.bottom;
-    const x = (FIELD.width - PANEL.width) / 2;
-    const y = (FIELD.height - height) / 2;
-    context.fillStyle = PALETTE.panel;
-    context.fillRect(x, y, PANEL.width, height);
-    context.textBaseline = 'alphabetic';
-    text(title, FIELD.width / 2, y + 78, 48, PALETTE.text, 'center');
-    for (let index = 0; index < lines.length; index += 1) {
-      text(lines[index], FIELD.width / 2, y + PANEL.top + index * PANEL.line, 22, PALETTE.muted, 'center');
+  function draw(game) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(2, Math.floor(canvas.clientWidth * dpr));
+    const h = Math.max(2, Math.floor(canvas.clientHeight * dpr));
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    gl.viewport(0, 0, w, h);
+    gl.enable(gl.DEPTH_TEST);
+    gl.clearColor(0.55, 0.75, 0.9, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    if (!staticBuf) staticBuf = buildStatic(game.city);
+    const p = game.player;
+    let eye, target;
+    if (game.camera) {
+      const c = game.camera;
+      eye = [c.x + Math.sin(c.angle) * c.dist, c.height, c.z + Math.cos(c.angle) * c.dist];
+      target = [c.x, 2, c.z];
+    } else {
+      const back = p.inCar != null ? 15 : 10.5;
+      const a = game.camAngle || 0;
+      eye = [p.x - Math.sin(a) * back, p.inCar != null ? 6.5 : 5.2, p.z - Math.cos(a) * back];
+      target = [p.x + Math.sin(a) * 6, 1.6, p.z + Math.cos(a) * 6];
     }
-    text(prompt, FIELD.width / 2, y + height - 40, 24, PALETTE.coin, 'center');
+    const mvp = matMul(matPerspective(1.05, w / Math.max(1, h), 0.1, 700), matLookAt(eye[0], eye[1], eye[2], target[0], target[1], target[2]));
+    gl.uniformMatrix4fv(loc.mvp, false, mvp);
+    bind(staticBuf);
+    gl.drawArrays(gl.TRIANGLES, 0, staticBuf.count);
+    const g = new Geo();
+    for (const c of game.crates) if (!c.taken) g.box(c.x, 0.6, c.z, 1.1, 1.1, 1.1, [0.85, 0.6, 0.15]);
+    for (const car of game.cars) drawCar(g, car, game.tick);
+    for (const ped of game.peds) drawPerson(g, ped.x, ped.z, ped.angle, [0.3 + ped.hue * 0.5, 0.4, 0.75 - ped.hue * 0.4], ped.down);
+    for (const cop of game.cops) drawPerson(g, cop.x, cop.z, cop.angle, [0.1, 0.15, 0.5], cop.down);
+    if (p.inCar == null) drawPerson(g, p.x, p.z, p.angle, [0.85, 0.25, 0.15]);
+    const dyn = upload(g, true);
+    bind(dyn);
+    gl.drawArrays(gl.TRIANGLES, 0, dyn.count);
+    gl.deleteBuffer(dyn.buf);
   }
-
-  const TITLE_LINES = ['Dodge the red blocks. Catch the gold coins.', 'Move with ← → or A D.  Pause with P.', ''];
-  const PAUSED_LINES = ['The blocks will wait for you.'];
-  const OVER_LINES = ['', ''];
-
-  /** Paint one frame: the field, then the HUD or a panel for the screen the game is on. */
-  function draw(state, screen, best) {
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = PALETTE.backdrop;
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
-    drawField(state);
-    if (screen === SCREEN_TITLE) {
-      TITLE_LINES[2] = bestLabel(best);
-      drawPanel('Block Dodger', TITLE_LINES, 'Press Space or click to start');
-      return;
-    }
-    drawHud(state);
-    if (screen === SCREEN_PAUSED) drawPanel('Paused', PAUSED_LINES, 'Press P to resume');
-    else if (screen === SCREEN_OVER) {
-      OVER_LINES[0] = finalLabel(state.score);
-      OVER_LINES[1] = bestLabel(best);
-      drawPanel('Game over', OVER_LINES, 'Press Space or click to play again');
-    }
-  }
-
-  resize();
-  window.addEventListener('resize', resize);
-  return { draw };
+  return { draw, ok: true };
 }
